@@ -10,31 +10,31 @@ def check_dependencies():
     missing = []
     try:
         import flask
-        print("✓ Flask installed")
+        print("[OK] Flask installed")
     except ImportError:
         missing.append("flask")
-        print("✗ Flask not installed")
+        print("[MISSING] Flask not installed")
     
     try:
         import flask_cors
-        print("✓ flask-cors installed")
+        print("[OK] flask-cors installed")
     except ImportError:
         missing.append("flask-cors")
-        print("✗ flask-cors not installed")
+        print("[MISSING] flask-cors not installed")
     
     try:
         import requests
-        print("✓ requests installed")
+        print("[OK] requests installed")
     except ImportError:
         missing.append("requests")
-        print("✗ requests not installed")
+        print("[MISSING] requests not installed")
     
     try:
         from bs4 import BeautifulSoup
-        print("✓ beautifulsoup4 installed")
+        print("[OK] beautifulsoup4 installed")
     except ImportError:
         missing.append("beautifulsoup4")
-        print("✗ beautifulsoup4 not installed")
+        print("[MISSING] beautifulsoup4 not installed")
     
     if missing:
         print("\n" + "="*50)

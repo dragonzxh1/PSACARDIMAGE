@@ -10,8 +10,12 @@ import os
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import urllib3
+import random
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from psa_item_info_extractor import PSAItemInfoExtractor
 
 # 禁用SSL警告（因为我们可能禁用SSL验证）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -49,6 +53,31 @@ class PSACardImageDownloader:
         })
         self.max_retries = 3
         self.retry_delay = 1  # 秒
+        # 防封与节流
+        self.min_request_interval = 0.6
+        self._last_request_ts = 0.0
+        self._user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        ]
+        self._proxy_pool = [p.strip() for p in os.getenv("PSA_PROXIES", "").split(",") if p.strip()]
+        self._current_proxies: Optional[Dict[str, str]] = None
+        # 安装 requests 重试适配器
+        retry_config = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_config, pool_connections=10, pool_maxsize=20)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        # 随机化首个 UA
+        self.session.headers["User-Agent"] = random.choice(self._user_agents)
         
     def _extract_cert_number(self, cert_input: str) -> str:
         """
@@ -84,53 +113,196 @@ class PSACardImageDownloader:
         urls_to_try = [self.base_url] + [url for url in self.backup_urls if url != self.base_url]
         
         last_error = None
+        tried_without_proxy = False  # 标记是否已尝试不使用代理
         
         for base_url in urls_to_try:
-            url = f"{base_url}/{cert_number}"
-            print(f"正在访问: {url}")
+            # 对于psacard.com，尝试两种URL格式：
+            # 1. /cert/{编号} (标准格式)
+            # 2. /cert/{编号}/psa (英文网站格式)
+            if 'psacard.com' in base_url and 'psacard.co.jp' not in base_url:
+                urls = [
+                    f"{base_url}/{cert_number}",
+                    f"{base_url}/{cert_number}/psa"
+                ]
+            else:
+                urls = [f"{base_url}/{cert_number}"]
             
-            for attempt in range(self.max_retries):
-                try:
-                    response = self.session.get(url, timeout=10, verify=self.verify_ssl)
-                    response.raise_for_status()
-                    print(f"[OK] 成功访问: {url}")
-                    # 更新self.base_url为成功访问的URL
-                    self.base_url = base_url
-                    return response.text
-                except requests.exceptions.SSLError as e:
-                    # SSL错误：如果不验证SSL，就禁用验证重试
-                    if self.verify_ssl:
-                        print(f"SSL错误，尝试禁用SSL验证...")
-                        self.session.verify = False
-                        try:
-                            response = self.session.get(url, timeout=10, verify=False)
-                            response.raise_for_status()
-                            print(f"[OK] 成功访问（禁用SSL验证）: {url}")
-                            self.base_url = base_url
-                            return response.text
-                        except Exception as e2:
-                            last_error = e2
+            for url in urls:
+                print(f"正在访问: {url}")
+                
+                for attempt in range(self.max_retries):
+                    try:
+                        self._throttle()
+                        if attempt > 0:
+                            self._maybe_rotate_identity()
+                        # 如果之前代理失败过，这次就不使用代理
+                        proxies_to_use = None if tried_without_proxy else self._current_proxies
+                        response = self.session.get(
+                            url,
+                            timeout=(10, 30),  # (连接超时, 读取超时)
+                            verify=self.verify_ssl,
+                            proxies=proxies_to_use,
+                            headers={"Referer": url}  # 设置Referer为证书页面本身
+                        )
+                        response.raise_for_status()
+                        print(f"[OK] 成功访问: {url}")
+                        # 更新self.base_url为成功访问的URL（去掉/psa后缀）
+                        self.base_url = base_url
+                        return response.text
+                    except requests.exceptions.ProxyError as e:
+                        # 代理错误：尝试不使用代理直接连接
+                        if not tried_without_proxy:
+                            error_msg = str(e)
+                            print(f"[代理错误] 代理连接失败，尝试不使用代理直接连接...")
+                            print(f"  错误详情: {error_msg}")
+                            tried_without_proxy = True
+                            try:
+                                self._throttle()
+                                response = self.session.get(
+                                    url,
+                                    timeout=(10, 30),
+                                    verify=self.verify_ssl,
+                                    proxies=None,  # 不使用代理
+                                    headers={"Referer": url}
+                                )
+                                response.raise_for_status()
+                                print(f"[OK] 成功访问（不使用代理）: {url}")
+                                self.base_url = base_url
+                                return response.text
+                            except Exception as e2:
+                                last_error = e2
+                                if attempt < self.max_retries - 1:
+                                    delay = self.retry_delay * (2 ** attempt) + random.uniform(0.5, 1.0)
+                                    print(f"  {delay:.2f}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
+                                    time.sleep(delay)
+                                else:
+                                    break
+                        else:
+                            # 已经尝试过不使用代理，仍然失败
+                            last_error = e
+                            if attempt < self.max_retries - 1:
+                                delay = self.retry_delay * (2 ** attempt) + random.uniform(0.5, 1.0)
+                                print(f"  {delay:.2f}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
+                                time.sleep(delay)
+                            else:
+                                break
+                    except requests.exceptions.SSLError as e:
+                        # SSL错误：如果不验证SSL，就禁用验证重试
+                        if self.verify_ssl:
+                            print(f"SSL错误，尝试禁用SSL验证...")
+                            self.session.verify = False
+                            try:
+                                self._throttle()
+                                self._maybe_rotate_identity()
+                                # 如果已经尝试过不使用代理，SSL重试时也不使用代理
+                                proxies_for_ssl = None if tried_without_proxy else self._current_proxies
+                                response = self.session.get(
+                                    url,
+                                    timeout=(10, 30),  # (连接超时, 读取超时)
+                                    verify=False,
+                                    proxies=proxies_for_ssl,
+                                    headers={"Referer": url}
+                                )
+                                response.raise_for_status()
+                                print(f"[OK] 成功访问（禁用SSL验证）: {url}")
+                                self.base_url = base_url
+                                return response.text
+                            except Exception as e2:
+                                last_error = e2
+                                break
+                        else:
+                            last_error = e
                             break
-                    else:
+                    except requests.exceptions.ConnectionError as e:
+                        # 连接错误：可能是网络问题、防火墙或网站不可用
+                        error_msg = str(e)
+                        # 如果是连接被拒绝且配置了代理但还没尝试不使用代理，尝试不使用代理
+                        if (not tried_without_proxy and self._current_proxies and 
+                            ("10061" in error_msg or "actively refused" in error_msg.lower() or "拒绝" in error_msg)):
+                            print(f"[连接错误] 连接被拒绝，尝试不使用代理直接连接...")
+                            print(f"  错误详情: {error_msg}")
+                            tried_without_proxy = True
+                            try:
+                                self._throttle()
+                                response = self.session.get(
+                                    url,
+                                    timeout=(10, 30),
+                                    verify=self.verify_ssl,
+                                    proxies=None,  # 不使用代理
+                                    headers={"Referer": url}
+                                )
+                                response.raise_for_status()
+                                print(f"[OK] 成功访问（不使用代理）: {url}")
+                                self.base_url = base_url
+                                return response.text
+                            except Exception as e2:
+                                last_error = e2
+                                if attempt < self.max_retries - 1:
+                                    delay = self.retry_delay * (2 ** attempt) + random.uniform(0.5, 1.0)
+                                    print(f"  {delay:.2f}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
+                                    time.sleep(delay)
+                                else:
+                                    break
+                        else:
+                            if "10061" in error_msg or "actively refused" in error_msg.lower() or "拒绝" in error_msg:
+                                print(f"[连接错误] 无法连接到服务器（可能被防火墙阻止或网站暂时不可用）")
+                                print(f"  错误详情: {error_msg}")
+                            else:
+                                print(f"[连接错误] {error_msg}")
+                            last_error = e
+                            if attempt < self.max_retries - 1:
+                                delay = self.retry_delay * (2 ** attempt) + random.uniform(0.5, 1.0)
+                                print(f"  {delay:.2f}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
+                                time.sleep(delay)
+                            else:
+                                break
+                    except requests.RequestException as e:
+                        # 命中限制时延长退避并轮换身份
+                        status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+                        if status in (429, 403):
+                            wait_s = (1.5 * (2 ** attempt)) + random.uniform(0.3, 0.9)
+                            print(f"命中限制（HTTP {status}），{wait_s:.2f}s 后重试并轮换身份...")
+                            time.sleep(wait_s)
+                            self._maybe_rotate_identity(force=True)
                         last_error = e
-                        break
-                except requests.RequestException as e:
-                    last_error = e
-                    if attempt < self.max_retries - 1:
-                        print(f"请求失败，{self.retry_delay}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
-                        time.sleep(self.retry_delay)
-                    else:
-                        break
+                        if attempt < self.max_retries - 1:
+                            delay = self.retry_delay * (2 ** attempt) + random.uniform(0.1, 0.4)
+                            print(f"请求失败，{delay:.2f}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
+                            time.sleep(delay)
+                        else:
+                            break
             
             # 如果这个URL失败了，尝试下一个
             if base_url != urls_to_try[-1]:  # 不是最后一个
                 print(f"[X] 无法访问 {url}，尝试下一个URL...")
-                time.sleep(1)  # 短暂延迟
+                time.sleep(0.8 + random.uniform(0.2, 0.8))  # 短暂随机延迟
         
         # 所有URL都失败了
-        raise Exception(f"无法访问任何PSA网站页面\n尝试的URL:\n" + 
-                       "\n".join([f"  - {url}/{cert_number}" for url in urls_to_try]) + 
-                       f"\n最后错误: {str(last_error)}")
+        error_type = type(last_error).__name__ if last_error else "Unknown"
+        error_msg = str(last_error) if last_error else "未知错误"
+        
+        # 提供更友好的错误消息
+        if "10061" in error_msg or "actively refused" in error_msg.lower() or "拒绝" in error_msg:
+            friendly_msg = (
+                f"无法连接到PSA网站服务器\n"
+                f"可能的原因：\n"
+                f"  1. 网络连接问题\n"
+                f"  2. 防火墙或代理设置阻止了连接\n"
+                f"  3. PSA网站暂时不可用\n"
+                f"\n尝试的URL:\n" + 
+                "\n".join([f"  - {url}/{cert_number}" for url in urls_to_try]) + 
+                f"\n\n错误详情: {error_type} - {error_msg}"
+            )
+        else:
+            friendly_msg = (
+                f"无法访问任何PSA网站页面\n"
+                f"尝试的URL:\n" + 
+                "\n".join([f"  - {url}/{cert_number}" for url in urls_to_try]) + 
+                f"\n\n错误类型: {error_type}\n"
+                f"错误详情: {error_msg}"
+            )
+        
+        raise Exception(friendly_msg)
     
     def _find_image_urls(self, html: str) -> List[str]:
         """
@@ -147,6 +319,14 @@ class PSACardImageDownloader:
         
         # 策略1: 查找所有img标签，优先寻找高清图片
         img_tags = soup.find_all('img')
+        print(f"[DEBUG] 找到 {len(img_tags)} 个img标签")
+        
+        # 记录所有img标签的src属性（用于调试）
+        if len(img_tags) > 0:
+            print(f"[DEBUG] 前5个img标签的src属性:")
+            for i, img in enumerate(img_tags[:5], 1):
+                src = img.get('src') or img.get('data-src', '') or img.get('data-lazy-src', '') or '无src'
+                print(f"  {i}. {str(src)[:150]}")
         
         # 首先查找明确标记为高清图的属性
         for img in img_tags:
@@ -247,6 +427,7 @@ class PSACardImageDownloader:
         
         # 也在HTML文本中直接搜索CloudFront URL（可能在某些属性或JavaScript中）
         cloudfront_urls = cloudfront_pattern.findall(html)
+        print(f"[DEBUG] 在HTML文本中搜索CloudFront URL，找到 {len(cloudfront_urls)} 个匹配")
         for url in cloudfront_urls:
             url_clean = url.rstrip('\\/').strip()
             if url_clean not in image_urls:
@@ -288,7 +469,8 @@ class PSACardImageDownloader:
                             test_url = f"{base_path}/{size}/{filename}"
                             if test_url not in image_urls:
                                 try:
-                                    response = self.session.head(test_url, timeout=3, allow_redirects=True, verify=self.verify_ssl)
+                                    self._throttle()
+                                    response = self.session.head(test_url, timeout=3, allow_redirects=True, verify=self.verify_ssl, proxies=self._current_proxies)
                                     if response.status_code == 200:
                                         content_type = response.headers.get('Content-Type', '')
                                         if 'image' in content_type:
@@ -302,7 +484,8 @@ class PSACardImageDownloader:
                         test_url = f"{base_path}/{filename}"
                         if test_url not in image_urls:
                             try:
-                                response = self.session.head(test_url, timeout=3, allow_redirects=True, verify=self.verify_ssl)
+                                self._throttle()
+                                response = self.session.head(test_url, timeout=3, allow_redirects=True, verify=self.verify_ssl, proxies=self._current_proxies)
                                 if response.status_code == 200:
                                     content_type = response.headers.get('Content-Type', '')
                                     if 'image' in content_type:
@@ -322,7 +505,8 @@ class PSACardImageDownloader:
                 for api_url in high_res_api_urls:
                     if api_url not in image_urls:
                         try:
-                            response = self.session.head(api_url, timeout=3, allow_redirects=True, verify=self.verify_ssl)
+                            self._throttle()
+                            response = self.session.head(api_url, timeout=3, allow_redirects=True, verify=self.verify_ssl, proxies=self._current_proxies)
                             if response.status_code == 200:
                                 content_type = response.headers.get('Content-Type', '')
                                 if 'image' in content_type:
@@ -355,7 +539,9 @@ class PSACardImageDownloader:
         
         # 去重并排序，返回所有找到的图片（不限制数量）
         image_urls_sorted = sorted(set(image_urls), key=sort_key)
-        print(f"[INFO] 总共找到 {len(image_urls_sorted)} 张图片")
+        print(f"[DEBUG] _find_image_urls 总共找到 {len(image_urls_sorted)} 张图片（去重后）")
+        if len(image_urls_sorted) == 0:
+            print(f"[DEBUG] 警告：未找到任何图片URL，HTML长度: {len(html)} 字符")
         return image_urls_sorted  # 返回所有找到的图片
     
     def _filter_images_by_cert(self, image_urls: List[str], cert_number: str) -> List[str]:
@@ -591,14 +777,35 @@ class PSACardImageDownloader:
         url = url.rstrip('\\/').strip()
         
         # 检查是否是PSA的CloudFront URL模式
-        # 支持 small, large, medium 等路径，或者已经是原图
-        pattern = r'(https?://[^/]+/cert/\d+)(?:/(?:small|large|medium|thumb))?/([^/?\\]+\.(?:jpg|jpeg|png|webp))'
-        match = re.search(pattern, url, re.I)
+        # 修复：明确匹配包含尺寸路径的URL：/cert/{编号}/{尺寸}/{文件名}
+        # 或者已经是原图的URL：/cert/{编号}/{文件名}
+        pattern_with_size = r'(https?://[^/]+/cert/\d+)/(small|large|medium|thumb)/([^/?\\]+\.(?:jpg|jpeg|png|webp))'
+        pattern_original = r'(https?://[^/]+/cert/\d+)/([^/?\\]+\.(?:jpg|jpeg|png|webp))'
+        
+        # 先尝试匹配包含尺寸路径的URL
+        match = re.search(pattern_with_size, url, re.I)
         if match:
             base_path = match.group(1)
-            filename = match.group(2).strip('\\/')  # 清理文件名中的反斜杠
+            size_path = match.group(2).lower()
+            filename = match.group(3).strip('\\/')  # 清理文件名中的反斜杠
             
             # 根据目标尺寸构造URL
+            if target_size == 'original':
+                return f"{base_path}/{filename}"
+            elif target_size == 'large':
+                return f"{base_path}/large/{filename}"
+            elif target_size == 'medium':
+                return f"{base_path}/medium/{filename}"
+            elif target_size == 'small':
+                return f"{base_path}/small/{filename}"
+        
+        # 如果上面没匹配到，尝试匹配已经是原图的URL
+        match = re.search(pattern_original, url, re.I)
+        if match:
+            base_path = match.group(1)
+            filename = match.group(2).strip('\\/')
+            
+            # 如果已经是原图，根据目标尺寸构造URL
             if target_size == 'original':
                 return f"{base_path}/{filename}"
             elif target_size == 'large':
@@ -632,21 +839,25 @@ class PSACardImageDownloader:
         
         # 获取页面HTML
         html = self._get_page_html(cert_num)
+        print(f"[DEBUG] 获取到HTML，长度: {len(html)} 字符")
         
         # 提取页面标题
         soup = BeautifulSoup(html, 'html.parser')
         title_tag = soup.find('title')
         page_title = title_tag.text.strip() if title_tag else f"PSA Certificate {cert_num}"
+        print(f"[DEBUG] 页面标题: {page_title}")
         
         # 查找图片URL（找到的可能是/small/或/large/）
         image_urls = self._find_image_urls(html)
         print(f"[INFO] 从HTML中找到 {len(image_urls)} 张图片")
         
         if not image_urls:
-            print("警告: 未能找到图片，尝试使用备用方法...")
+            print("[WARNING] 未能从HTML中找到图片，尝试使用备用方法...")
             # 备用方法: 直接尝试常见的PSA图片URL模式
             image_urls = self._try_common_url_patterns(cert_num)
             print(f"[INFO] 备用方法找到 {len(image_urls)} 张图片")
+            if len(image_urls) == 0:
+                print(f"[WARNING] 备用方法也未找到图片，证书编号: {cert_num}")
         
         # 先不过滤证书编号，保留所有找到的图片URL
         # 因为转换过程需要基于找到的URL进行，如果提前过滤可能会丢失有效的small/medium URL
@@ -680,7 +891,7 @@ class PSACardImageDownloader:
                     else:
                         # 方法2：直接替换路径
                         large_url = url_clean.replace('/small/', '/large/')
-                        converted_urls.append(large_url)
+                        converted_urls.append(large_url.rstrip('\\/'))
                         print(f"[INFO] 预览模式：small -> large（直接替换） {url_clean[:80]} -> {large_url[:80]}")
                 elif '/medium/' in url_clean:
                     # medium转换为large
@@ -689,22 +900,41 @@ class PSACardImageDownloader:
                     print(f"[INFO] 预览模式：medium -> large {url_clean[:80]} -> {large_url[:80]}")
                 elif '/large/' in url_clean:
                     # 已经是大缩略图，直接使用
-                    converted_urls.append(url_clean)
+                    converted_urls.append(url_clean.rstrip('\\/'))
                     print(f"[INFO] 预览模式：已是large {url_clean[:80]}")
                 else:
                     # 如果是原图格式（没有size路径），尝试转换为large
                     # 原图: /cert/{编号}/{文件名}.jpg -> /cert/{编号}/large/{文件名}.jpg
-                    orig_match = re.search(r'(https?://[^/]+/cert/\d+)/([^/?\\]+\.(?:jpg|jpeg|png|webp))', url_clean, re.I)
-                    if orig_match:
-                        base_path = orig_match.group(1)
-                        filename = orig_match.group(2)
-                        large_url = f"{base_path}/large/{filename}"
-                        converted_urls.append(large_url)
+                    # 使用_convert_to_size方法，更可靠
+                    large_url = self._convert_to_size(url_clean, 'large')
+                    if large_url:
+                        converted_urls.append(large_url.rstrip('\\/'))
                         print(f"[INFO] 预览模式：原图 -> large {url_clean[:80]} -> {large_url[:80]}")
                     else:
-                        # 无法识别格式，保留原URL
-                        converted_urls.append(url_clean)
-                        print(f"[WARNING] 预览模式：无法识别URL格式，保留原URL {url_clean[:80]}")
+                        # 如果_convert_to_size失败，尝试正则匹配
+                        orig_match = re.search(r'(https?://[^/]+/cert/\d+)/([^/?\\]+\.(?:jpg|jpeg|png|webp))', url_clean, re.I)
+                        if orig_match:
+                            base_path = orig_match.group(1)
+                            filename = orig_match.group(2).strip('\\/')
+                            large_url = f"{base_path}/large/{filename}"
+                            converted_urls.append(large_url.rstrip('\\/'))
+                            print(f"[INFO] 预览模式：原图 -> large（正则匹配） {url_clean[:80]} -> {large_url[:80]}")
+                        else:
+                            # 无法识别格式，但如果是PSA URL，尝试直接添加/large/
+                            if '/cert/' in url_clean and any(ext in url_clean for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                                # 尝试在/cert/{编号}/之后插入large/
+                                large_url = re.sub(r'(/cert/\d+)/([^/?\\]+\.(?:jpg|jpeg|png|webp))', r'\1/large/\2', url_clean, flags=re.I)
+                                if large_url != url_clean:
+                                    converted_urls.append(large_url.rstrip('\\/'))
+                                    print(f"[INFO] 预览模式：原图 -> large（插入路径） {url_clean[:80]} -> {large_url[:80]}")
+                                else:
+                                    # 最后尝试：保留原URL（可能是其他格式的URL）
+                                    converted_urls.append(url_clean.rstrip('\\/'))
+                                    print(f"[WARNING] 预览模式：无法识别URL格式，保留原URL {url_clean[:80]}")
+                            else:
+                                # 不是PSA URL格式，保留原URL
+                                converted_urls.append(url_clean.rstrip('\\/'))
+                                print(f"[WARNING] 预览模式：非PSA URL格式，保留原URL {url_clean[:80]}")
             else:
                 # 下载模式：强制使用原图（不管image_size参数是什么）
                 # 将任何尺寸的URL转换为原图
@@ -727,47 +957,90 @@ class PSACardImageDownloader:
         
         print(f"[INFO] URL转换完成：{len(filtered_image_urls)} -> {len(converted_urls)}")
         
+        # 在过滤前，检查转换后的URL是否包含证书编号
+        urls_without_cert = []
+        for url in converted_urls:
+            cert_match = re.search(r'/cert/(\d+)', url)
+            if not cert_match:
+                urls_without_cert.append(url)
+        
+        if urls_without_cert:
+            print(f"[WARNING] 转换后有 {len(urls_without_cert)} 个URL不包含证书编号格式:")
+            for url in urls_without_cert[:3]:
+                print(f"  - {url[:100]}")
+        
         # 转换后过滤证书编号：确保转换后的URL属于当前证书编号
-        # 注意：如果页面中显示的图片证书编号与页面URL的证书编号不一致，
-        # 可能是页面设计的特殊情况（例如显示了相关卡片的图片）
-        # 在这种情况下，我们应该保留页面中实际显示的图片，即使证书编号不匹配
+        # 对于PSA Japan等特殊情况，页面中显示的图片证书编号可能与页面URL的证书编号不一致
+        # 在预览模式下，应该放宽条件，保留页面中找到的所有图片
         
-        final_urls_before_filter = converted_urls.copy()
-        final_urls = self._filter_images_by_cert(converted_urls, cert_num)
+        # 检查转换后的URL中有哪些不同的证书编号
+        found_cert_nums = set()
+        urls_with_cert = []
+        for url in converted_urls:
+            cert_match = re.search(r'/cert/(\d+)', url)
+            if cert_match:
+                found_cert_nums.add(cert_match.group(1))
+                urls_with_cert.append(url)
         
-        # 如果过滤后没有图片，但转换前有图片，说明所有图片的证书编号都不匹配
-        # 这可能是因为页面显示的图片属于其他证书，但既然页面显示了这些图片，
-        # 说明它们是相关的，我们应该保留它们
-        if len(final_urls) == 0 and len(converted_urls) > 0:
-            print(f"[WARNING] 转换后所有图片的证书编号都不匹配（期望 {cert_num}）")
-            print(f"[INFO] 页面中显示的图片证书编号与页面URL不一致，可能是页面设计特殊情况")
-            print(f"[INFO] 保留页面中实际显示的图片（即使证书编号不匹配）")
+        # 在预览模式下，如果页面中找到的图片证书编号与页面URL不一致，
+        # 说明可能是PSA Japan等特殊情况，应该保留这些图片
+        if preview_mode and found_cert_nums and cert_num not in found_cert_nums:
+            print(f"[INFO] 预览模式：页面中找到的图片证书编号 {', '.join(found_cert_nums)} 与页面URL证书编号 {cert_num} 不一致")
+            print(f"[INFO] 预览模式：这是PSA Japan等特殊情况，保留页面中找到的所有图片用于预览")
+            # 在预览模式下，保留所有找到的图片（最多保留前4个，通常是front和back）
+            final_urls = urls_with_cert[:4]  # 最多保留4个（通常是2张front + 2张back）
+            print(f"[INFO] 预览模式：保留了 {len(final_urls)} 个URL用于预览")
+        else:
+            # 正常过滤：只保留属于当前证书编号的图片
+            final_urls_before_filter = converted_urls.copy()
+            final_urls = self._filter_images_by_cert(converted_urls, cert_num)
             
-            # 检查转换后的URL中有哪些不同的证书编号
-            found_cert_nums = set()
-            for url in converted_urls:
-                cert_match = re.search(r'/cert/(\d+)', url)
-                if cert_match:
-                    found_cert_nums.add(cert_match.group(1))
-            
-            if found_cert_nums:
-                print(f"[INFO] 页面中找到的图片证书编号: {', '.join(found_cert_nums)}")
-                print(f"[INFO] 保留所有找到的图片（共 {len(converted_urls)} 张）")
-                # 保留所有转换后的URL，即使证书编号不匹配
-                final_urls = converted_urls
-            else:
-                # 如果没有找到任何证书编号，尝试不严格过滤
-                print(f"[INFO] 未找到明确的证书编号，保留所有转换后的URL")
-                final_urls = converted_urls
-        elif len(final_urls) < len(converted_urls):
-            print(f"[INFO] 转换后过滤：{len(converted_urls)} -> {len(final_urls)}（部分图片证书编号不匹配）")
-            # 显示被过滤的URL信息
-            filtered_out = [url for url in converted_urls if url not in final_urls]
-            for url in filtered_out[:3]:
-                cert_match = re.search(r'/cert/(\d+)', url)
-                if cert_match:
-                    url_cert_num = cert_match.group(1)
-                    print(f"  [过滤] URL证书编号 {url_cert_num} != 期望 {cert_num}: {url[:80]}")
+            # 如果过滤后没有图片，但转换前有图片，说明所有图片的证书编号都不匹配
+            # 在预览模式下，如果所有URL都被过滤掉，尝试放宽过滤条件
+            if len(final_urls) == 0 and len(converted_urls) > 0:
+                print(f"[WARNING] 转换后所有图片的证书编号都不匹配（期望 {cert_num}）")
+                print(f"[INFO] 页面中显示的图片证书编号与页面URL不一致")
+                
+                if found_cert_nums:
+                    print(f"[INFO] 页面中找到的图片证书编号: {', '.join(found_cert_nums)}（期望 {cert_num}）")
+                    
+                    # 在预览模式下，如果所有URL都被过滤掉，尝试放宽条件
+                    if preview_mode:
+                        # 优先尝试保留不包含证书编号的URL（可能是其他格式）
+                        if urls_without_cert:
+                            print(f"[INFO] 预览模式：尝试保留不包含证书编号的URL（可能是其他格式）")
+                            final_urls = urls_without_cert[:2]  # 最多保留2个
+                            print(f"[INFO] 预览模式：保留了 {len(final_urls)} 个不包含证书编号的URL")
+                        else:
+                            # 如果没有不包含证书编号的URL，在预览模式下放宽条件，保留前几个URL
+                            print(f"[INFO] 预览模式：放宽过滤条件，保留前 {min(2, len(urls_with_cert))} 个URL用于预览")
+                            final_urls = urls_with_cert[:2]  # 最多保留2个
+                            print(f"[INFO] 预览模式：保留了 {len(final_urls)} 个URL（证书编号可能不匹配）")
+                    else:
+                        print(f"[WARNING] 严格过滤：不保留证书编号不匹配的图片，返回空列表")
+                        final_urls = []
+                else:
+                    # 如果没有找到任何证书编号，在预览模式下尝试保留这些URL
+                    if preview_mode:
+                        if urls_without_cert:
+                            print(f"[INFO] 预览模式：未找到明确的证书编号，但保留不包含证书编号的URL")
+                            final_urls = urls_without_cert[:2]  # 最多保留2个
+                        else:
+                            # 如果连不包含证书编号的URL都没有，保留前几个转换后的URL
+                            print(f"[INFO] 预览模式：未找到明确的证书编号，保留前 {min(2, len(converted_urls))} 个转换后的URL")
+                            final_urls = converted_urls[:2]  # 最多保留2个
+                    else:
+                        print(f"[WARNING] 未找到明确的证书编号，返回空列表")
+                        final_urls = []
+            elif len(final_urls) < len(converted_urls):
+                print(f"[INFO] 转换后过滤：{len(converted_urls)} -> {len(final_urls)}（部分图片证书编号不匹配）")
+                # 显示被过滤的URL信息
+                filtered_out = [url for url in converted_urls if url not in final_urls]
+                for url in filtered_out[:3]:
+                    cert_match = re.search(r'/cert/(\d+)', url)
+                    if cert_match:
+                        url_cert_num = cert_match.group(1)
+                        print(f"  [过滤] URL证书编号 {url_cert_num} != 期望 {cert_num}: {url[:80]}")
         
         # 过滤掉不必要的文件（如table-image-certified.png等非卡片图片）
         final_urls = self._filter_unnecessary_files(final_urls)
@@ -837,7 +1110,8 @@ class PSACardImageDownloader:
             if url in possible_urls:
                 continue
             try:
-                response = self.session.head(url, timeout=3, allow_redirects=True, verify=self.verify_ssl)
+                self._throttle()
+                response = self.session.head(url, timeout=3, allow_redirects=True, verify=self.verify_ssl, proxies=self._current_proxies)
                 if response.status_code == 200:
                     content_type = response.headers.get('Content-Type', '')
                     if 'image' in content_type:
@@ -896,10 +1170,33 @@ class PSACardImageDownloader:
         except Exception as e:
             print(f"\n[X] 下载失败: {url}\n  错误: {str(e)}")
             return False
+
+    # ---------------- 防封/限速辅助 ----------------
+    def _throttle(self):
+        base_interval = self.min_request_interval
+        jitter = random.uniform(0.05, 0.2)
+        now = time.time()
+        wait = (self._last_request_ts + base_interval + jitter) - now
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request_ts = time.time()
+
+    def _maybe_rotate_identity(self, force: bool = False):
+        if force or random.random() < 0.35:
+            self.session.headers["User-Agent"] = random.choice(self._user_agents)
+        if self._proxy_pool:
+            if force or random.random() < 0.25:
+                proxy = random.choice(self._proxy_pool)
+                if proxy.lower().startswith("http"):
+                    self._current_proxies = {"http": proxy, "https": proxy}
+                else:
+                    self._current_proxies = None
+        else:
+            self._current_proxies = None
     
     def download_images(self, cert_number: str, save_dir: str = "downloads") -> bool:
         """
-        下载指定证书编号的所有高清图片
+        下载指定证书编号的所有高清图片，并收集Item Information
         
         Args:
             cert_number: PSA证书编号
@@ -909,20 +1206,49 @@ class PSACardImageDownloader:
             是否成功下载至少一张图片
         """
         try:
+            # 提取证书编号
+            cert_num = self._extract_cert_number(cert_number)
+            
+            # 创建保存目录
+            save_path = Path(save_dir) / f"PSA_{cert_num}"
+            save_path.mkdir(parents=True, exist_ok=True)
+            
+            # 获取页面HTML以提取Item Information
+            print("\n正在获取页面信息...")
+            html = self._get_page_html(cert_num)
+            
+            # 提取Item Information
+            print("正在提取Item Information...")
+            item_info_extractor = PSAItemInfoExtractor()
+            item_info = item_info_extractor.extract_item_info(html)
+            
+            if item_info:
+                # 保存Item Information文件
+                item_info_file = item_info_extractor.save_item_info_text(item_info, save_path, cert_num)
+                print(f"[OK] Item Information已保存: {item_info_file}")
+                
+                # 显示提取到的关键信息
+                brand_title = item_info_extractor.get_brand_title(item_info)
+                if brand_title:
+                    print(f"[INFO] Brand/Title: {brand_title}")
+            else:
+                print("[WARNING] 未能提取到Item Information")
+            
             # 获取高清图片URL
+            print("\n正在查找图片...")
             image_urls, page_title = self.get_high_res_images(cert_number)
             
             if not image_urls:
                 print(f"错误: 未能找到证书编号 {cert_number} 的图片")
+                # 即使没有图片，如果成功提取了Item Information，也算部分成功
+                if item_info:
+                    print(f"[INFO] 已保存Item Information到: {save_path.absolute()}")
+                    return True
                 return False
             
             print(f"\n找到 {len(image_urls)} 张图片:")
             for i, url in enumerate(image_urls, 1):
                 print(f"  {i}. {url}")
-            
-            # 创建保存目录
-            cert_num = self._extract_cert_number(cert_number)
-            save_path = Path(save_dir) / f"PSA_{cert_num}"
             
             # 下载所有图片
             success_count = 0
@@ -938,9 +1264,15 @@ class PSACardImageDownloader:
             if success_count > 0:
                 print(f"\n[OK] 成功下载 {success_count}/{len(image_urls)} 张图片")
                 print(f"保存位置: {save_path.absolute()}")
+                if item_info:
+                    print(f"[OK] Item Information已保存: {save_path / f'{cert_num}_item_info.txt'}")
                 return True
             else:
                 print("\n[X] 所有图片下载失败")
+                # 即使图片下载失败，如果成功提取了Item Information，也算部分成功
+                if item_info:
+                    print(f"[INFO] 已保存Item Information到: {save_path.absolute()}")
+                    return True
                 return False
                 
         except Exception as e:

@@ -266,6 +266,45 @@
         .example strong {
             color: #333;
         }
+
+        .file-upload-area {
+            border: 2px dashed #e0e0e0;
+            border-radius: 10px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #fafafa;
+        }
+
+        .file-upload-area:hover {
+            border-color: #667eea;
+            background: #f0f0ff;
+        }
+
+        .file-upload-area.dragover {
+            border-color: #667eea;
+            background: #e8e8ff;
+        }
+
+        .file-upload-content {
+            pointer-events: none;
+        }
+
+        .file-upload-content p {
+            margin: 5px 0;
+            color: #666;
+        }
+
+        .file-upload-hint {
+            font-size: 0.85em;
+            color: #999;
+        }
+
+        .file-name {
+            color: #667eea;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -288,12 +327,31 @@
                     id="certNumber" 
                     name="certNumber" 
                     placeholder="96098359" 
-                    required
                     data-i18n-placeholder="placeholder.certNumber"
                 >
                 <div class="example">
                     <strong data-i18n="example.title">Example:</strong> 
-                    <span data-i18n="example.text">96098359 or PSAbian78928691</span>
+                    <span data-i18n="example.text">96098359 or PSAbian78928691</span><br>
+                    <strong data-i18n="example.multiple.title">Multiple cards:</strong> 
+                    <span data-i18n="example.multiple.text">96098359+163795779+12345678 (use + to separate)</span>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label data-i18n="label.batchUpload">Or Upload File (Batch Download)</label>
+                <div class="file-upload-area" id="fileUploadArea">
+                    <input type="file" id="fileInput" accept=".txt,.xlsx,.xls" style="display: none;">
+                    <div class="file-upload-content">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-bottom: 10px;">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <p data-i18n="fileUpload.text">Click to select or drag and drop</p>
+                        <p class="file-upload-hint" data-i18n="fileUpload.hint">Text file (.txt) or Excel file (.xlsx, .xls)<br>One certificate ID per line</p>
+                        <p class="file-name" id="fileName" style="display: none; margin-top: 10px; font-weight: 600; color: #667eea;"></p>
+                        <button type="button" id="clearFileBtn" style="display: none; margin-top: 10px; padding: 8px 16px; background: #dc3545; color: white; border: none; border-radius: 5px; cursor: pointer; pointer-events: auto;" onclick="clearFile()">Clear File</button>
+                    </div>
                 </div>
             </div>
 
@@ -320,7 +378,7 @@
 
         <div id="previewSection" class="preview-section">
             <h3 data-i18n="preview.title">Found Images:</h3>
-            <ul id="imageList" class="image-list"></ul>
+            <div id="previewContent" class="image-list"></div>
         </div>
     </div>
 
@@ -330,8 +388,10 @@
             en: {
                 'title': 'PSA Card Image Downloader',
                 'subtitle': 'Download high-resolution images from PSA certificates',
-                'label.certNumber': 'Certificate Number',
-                'placeholder.certNumber': '96098359',
+                'label.certNumber': 'Certificate Number(s)',
+                'placeholder.certNumber': '96098359 or 96098359+163795779',
+                'example.multiple.title': 'Multiple cards:',
+                'example.multiple.text': '96098359+163795779+12345678 (use + to separate)',
                 'button.preview': 'Preview Images',
                 'button.download': 'Download Images',
                 'button.downloading': 'Downloading...',
@@ -349,16 +409,25 @@
                 'status.error': 'Error: ',
                 'status.preview.success': 'Found {count} image(s)',
                 'status.preview.error': 'No images found for this certificate.',
+                'status.preview.fileNotSupported': 'Preview is not available when a batch file is uploaded. Please use Download Images.',
                 'preview.title': 'Found Images:',
                 'error.noCertNumber': 'Please enter a certificate number',
                 'error.network': 'Network error. Please try again.',
-                'error.server': 'Server error. Please try again later.'
+                'error.server': 'Server error. Please try again later.',
+                'label.batchUpload': 'Or Upload File (Batch Download)',
+                'fileUpload.text': 'Click to select or drag and drop',
+                'fileUpload.hint': 'Text file (.txt) or Excel file (.xlsx, .xls)<br>One certificate ID per line',
+                'status.batch.processing': 'Processing {current}/{total} certificates...',
+                'status.batch.success': 'Batch download completed! {success} succeeded, {failed} failed.',
+                'error.noFile': 'Please select a file or enter certificate number(s)'
             },
             zh: {
                 'title': 'PSA卡片图片下载器',
                 'subtitle': '下载PSA证书的高清图片',
                 'label.certNumber': '证书编号',
-                'placeholder.certNumber': '96098359',
+                'placeholder.certNumber': '96098359 或 96098359+163795779',
+                'example.multiple.title': '多个卡片：',
+                'example.multiple.text': '96098359+163795779+12345678 (使用+号分隔)',
                 'button.preview': '预览图片',
                 'button.download': '下载图片',
                 'button.downloading': '下载中...',
@@ -376,10 +445,17 @@
                 'status.error': '错误：',
                 'status.preview.success': '找到 {count} 张图片',
                 'status.preview.error': '未找到此证书的图片。',
+                'status.preview.fileNotSupported': '上传批量文件时无法使用预览，请直接点击下载图片。',
                 'preview.title': '找到的图片：',
                 'error.noCertNumber': '请输入证书编号',
                 'error.network': '网络错误，请重试。',
-                'error.server': '服务器错误，请稍后再试。'
+                'error.server': '服务器错误，请稍后再试。',
+                'label.batchUpload': '或上传文件（批量下载）',
+                'fileUpload.text': '点击选择或拖拽文件',
+                'fileUpload.hint': '文本文件 (.txt) 或 Excel 文件 (.xlsx, .xls)<br>每行一个证书编号',
+                'status.batch.processing': '正在处理 {current}/{total} 个证书...',
+                'status.batch.success': '批量下载完成！成功 {success} 个，失败 {failed} 个。',
+                'error.noFile': '请选择文件或输入证书编号'
             }
         };
 
@@ -419,32 +495,57 @@
         }
 
         function showPreview(imageUrls) {
+            // 兼容单卡片显示（向后兼容）
             const previewSection = document.getElementById('previewSection');
-            const imageList = document.getElementById('imageList');
+            const previewContent = document.getElementById('previewContent');
             
-            imageList.innerHTML = '';
-            imageUrls.forEach((url, index) => {
-                const li = document.createElement('li');
-                
-                // 创建链接
-                const a = document.createElement('a');
-                a.href = url;
-                a.target = '_blank';
-                a.textContent = `${index + 1}. ${url}`;
-                li.appendChild(a);
-                
-                // 添加图片预览（显示大缩略图）
+            previewContent.innerHTML = '';
+            imageUrls.forEach(url => {
                 const img = document.createElement('img');
                 img.src = url;
-                img.alt = `Image ${index + 1}`;
-                img.onerror = function() {
-                    this.style.display = 'none';
-                };
-                img.onclick = () => window.open(url, '_blank');
-                li.appendChild(img);
-                
-                imageList.appendChild(li);
+                img.alt = 'PSA Card Image';
+                img.loading = 'lazy';
+                img.style.marginBottom = '15px';
+                previewContent.appendChild(img);
             });
+            previewSection.classList.add('active');
+        }
+        
+        function showPreviewMultiple(imageUrlsByCert, certInfo) {
+            const previewSection = document.getElementById('previewSection');
+            const previewContent = document.getElementById('previewContent');
+            
+            previewContent.innerHTML = '';
+            
+            // 按证书编号分组显示
+            for (const [certNum, imageUrls] of Object.entries(imageUrlsByCert)) {
+                if (!Array.isArray(imageUrls) || imageUrls.length === 0) continue;
+                
+                const certInfoItem = certInfo && certInfo[certNum] ? certInfo[certNum] : { title: `Certificate ${certNum}` };
+                const certTitle = certInfoItem.title || `Certificate ${certNum}`;
+                
+                const certDiv = document.createElement('div');
+                certDiv.className = 'cert-group';
+                certDiv.style.marginBottom = '30px';
+                certDiv.style.paddingBottom = '20px';
+                certDiv.style.borderBottom = '2px solid #e0e0e0';
+                certDiv.innerHTML = `<h3 style="margin-top: 20px; margin-bottom: 15px; color: #667eea; font-size: 1.2em;">${certTitle} <span style="color: #999; font-size: 0.8em;">(${certNum})</span></h3>`;
+                
+                const imageContainer = document.createElement('div');
+                imageContainer.className = 'image-list';
+                
+                imageUrls.forEach(url => {
+                    const img = document.createElement('img');
+                    img.src = url;
+                    img.alt = certTitle;
+                    img.loading = 'lazy';
+                    img.style.marginBottom = '15px';
+                    imageContainer.appendChild(img);
+                });
+                
+                certDiv.appendChild(imageContainer);
+                previewContent.appendChild(certDiv);
+            }
             
             previewSection.classList.add('active');
         }
@@ -455,9 +556,22 @@
         }
 
         async function previewImages() {
-            const certNumber = document.getElementById('certNumber').value.trim();
+            const fileInput = document.getElementById('fileInput');
+            if (fileInput && fileInput.files && fileInput.files.length > 0) {
+                showStatus(i18n[currentLang]['status.preview.fileNotSupported'], 'info');
+                return;
+            }
+            const certNumberInput = document.getElementById('certNumber').value.trim();
             
-            if (!certNumber) {
+            if (!certNumberInput) {
+                showStatus(i18n[currentLang]['error.noCertNumber'], 'error');
+                return;
+            }
+
+            // 解析多个证书编号（用+分隔）
+            const certNumbers = certNumberInput.split('+').map(cn => cn.trim()).filter(cn => cn.length > 0);
+            
+            if (certNumbers.length === 0) {
                 showStatus(i18n[currentLang]['error.noCertNumber'], 'error');
                 return;
             }
@@ -471,22 +585,35 @@
             hidePreview();
 
             try {
+                // 获取图片尺寸，预览默认使用large
+                const imageSize = document.getElementById('imageSize').value || 'large';
+                
                 const response = await fetch('/api/preview', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        cert_number: certNumber,
-                        language: currentLang
+                        cert_numbers: certNumbers,  // 改为数组格式
+                        language: currentLang,
+                        image_size: imageSize  // 传递图片尺寸参数
                     })
                 });
 
                 const data = await response.json();
 
                 if (data.success) {
-                    showPreview(data.image_urls);
-                    const message = i18n[currentLang]['status.preview.success'].replace('{count}', data.count);
+                    // data.image_urls 现在是一个对象，每个证书编号对应一组图片
+                    if (certNumbers.length > 1 || (typeof data.image_urls === 'object' && !Array.isArray(data.image_urls))) {
+                        showPreviewMultiple(data.image_urls, data.cert_info);
+                    } else {
+                        // 单个卡片，兼容旧格式
+                        showPreview(Array.isArray(data.image_urls) ? data.image_urls : Object.values(data.image_urls)[0] || []);
+                    }
+                    const totalCount = typeof data.image_urls === 'object' && !Array.isArray(data.image_urls) 
+                        ? Object.values(data.image_urls).reduce((sum, urls) => sum + (Array.isArray(urls) ? urls.length : 0), 0)
+                        : (Array.isArray(data.image_urls) ? data.image_urls.length : 0);
+                    const message = i18n[currentLang]['status.preview.success'].replace('{count}', totalCount);
                     showStatus(message, 'success');
                 } else {
                     const errorMsg = data.message || i18n[currentLang]['status.preview.error'];
@@ -511,10 +638,13 @@
         async function downloadImages(event) {
             event.preventDefault();
             
-            const certNumber = document.getElementById('certNumber').value.trim();
+            const certNumberInput = document.getElementById('certNumber').value.trim();
+            const fileInput = document.getElementById('fileInput');
+            const selectedFile = fileInput.files[0];
             
-            if (!certNumber) {
-                showStatus(i18n[currentLang]['error.noCertNumber'], 'error');
+            // 检查是否有文件上传或证书编号输入
+            if (!certNumberInput && !selectedFile) {
+                showStatus(i18n[currentLang]['error.noFile'], 'error');
                 return;
             }
 
@@ -531,30 +661,67 @@
 
                 const imageSize = document.getElementById('imageSize').value || 'original';
                 
-                const response = await fetch('/api/download', {
+                let response;
+                
+                // 如果有文件上传，使用批量下载API
+                if (selectedFile) {
+                    const formData = new FormData();
+                    formData.append('file', selectedFile);
+                    formData.append('language', currentLang);
+                    formData.append('image_size', imageSize);
+                    
+                    response = await fetch('/api/batch_download', {
+                        method: 'POST',
+                        body: formData
+                    });
+                } else {
+                    // 解析多个证书编号（用+分隔）
+                    const certNumbers = certNumberInput.split('+').map(cn => cn.trim()).filter(cn => cn.length > 0);
+                    
+                    if (certNumbers.length === 0) {
+                        showStatus(i18n[currentLang]['error.noCertNumber'], 'error');
+                        return;
+                    }
+                    
+                    response = await fetch('/api/download', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        cert_number: certNumber,
+                            cert_numbers: certNumbers,
                         language: currentLang,
                         image_size: imageSize
                     })
                 });
+                }
 
                 const data = await response.json();
 
                 if (data.success) {
-                    showPreview(data.image_urls);
+                    // 批量下载的结果
+                    if (selectedFile && data.total_certs) {
+                        const successMsg = i18n[currentLang]['status.batch.success']
+                            .replace('{success}', data.success_certs)
+                            .replace('{failed}', data.failed_certs);
+                        showStatus(successMsg, 'success');
+                    } else {
+                        // 单个或多个证书下载的结果
+                        if (data.image_urls && typeof data.image_urls === 'object' && !Array.isArray(data.image_urls)) {
+                            showPreviewMultiple(data.image_urls, data.cert_info);
+                        } else if (data.image_urls && Array.isArray(data.image_urls)) {
+                            showPreview(data.image_urls);
+                    }
                     const successMsg = i18n[currentLang]['status.success'];
+                        showStatus(successMsg, 'success');
+                    }
                     
                     // Auto download after a short delay
+                    if (data.download_url) {
                     setTimeout(() => {
                         window.location.href = data.download_url;
                     }, 500);
-                    
-                    showStatus(successMsg, 'success');
+                    }
                 } else {
                     const errorMsg = data.message || (i18n[currentLang]['status.error'] + 'Unknown error');
                     showStatus(errorMsg, 'error');
@@ -570,6 +737,67 @@
                 downloadBtn.textContent = originalText;
             }
         }
+
+        // File upload handlers
+        const fileInput = document.getElementById('fileInput');
+        const fileUploadArea = document.getElementById('fileUploadArea');
+        const fileName = document.getElementById('fileName');
+
+        fileUploadArea.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        function clearFile() {
+            fileInput.value = '';
+            fileName.style.display = 'none';
+            document.getElementById('clearFileBtn').style.display = 'none';
+        }
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                fileName.textContent = file.name;
+                fileName.style.display = 'block';
+                document.getElementById('clearFileBtn').style.display = 'block';
+                // 清空证书编号输入框
+                document.getElementById('certNumber').value = '';
+            } else {
+                clearFile();
+            }
+        });
+
+        // Drag and drop handlers
+        fileUploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            fileUploadArea.classList.add('dragover');
+        });
+
+        fileUploadArea.addEventListener('dragleave', () => {
+            fileUploadArea.classList.remove('dragover');
+        });
+
+        fileUploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            fileUploadArea.classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                const file = files[0];
+                // 检查文件类型
+                const validTypes = ['.txt', '.xlsx', '.xls'];
+                const fileExt = '.' + file.name.split('.').pop().toLowerCase();
+                
+                if (validTypes.includes(fileExt)) {
+                    fileInput.files = files;
+                    fileName.textContent = file.name;
+                    fileName.style.display = 'block';
+                    // 清空证书编号输入框
+                    document.getElementById('certNumber').value = '';
+                } else {
+                    showStatus('Please upload a .txt, .xlsx, or .xls file', 'error');
+                }
+            }
+        });
 
         // Event listeners
         document.getElementById('downloadForm').addEventListener('submit', downloadImages);
