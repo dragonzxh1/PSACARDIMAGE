@@ -9,6 +9,9 @@ A professional tool for downloading high-resolution images from PSA-certified ca
 - ✅ 根据PSA证书编号自动访问验证页面 / Automatically access PSA certificate pages
 - ✅ 智能提取高清图片下载地址（支持多种URL模式识别） / Intelligent extraction of high-resolution image URLs
 - ✅ 自动下载并保存卡片高清图片 / Automatic download and save high-resolution card images
+- ✅ **批量下载支持**：支持从TXT/Excel文件批量导入证书编号进行下载 / **Batch download support**: Import certificate numbers from TXT/Excel files
+- ✅ **Item Information提取**：自动提取并保存卡片的详细信息（品牌、标题、年份等） / **Item Information extraction**: Automatically extract and save card details (brand, title, year, etc.)
+- ✅ **多尺寸支持**：支持下载原始尺寸、大图、中图、小图 / **Multiple size support**: Download original, large, medium, or small images
 - ✅ 支持进度显示和错误重试机制 / Progress display and error retry mechanism
 - ✅ **Web界面支持（中英文双语）** / **Web interface with bilingual support (English/Chinese)**
 - ✅ 命令行和编程接口 / Command-line and programming interface
@@ -43,6 +46,9 @@ python app.py
 - 📱 响应式设计，支持移动设备 / Responsive design for mobile devices
 - 👁️ 图片预览功能 / Image preview functionality
 - 📦 自动打包为ZIP文件下载 / Automatic ZIP file download
+- 📋 **批量下载功能**：支持上传TXT或Excel文件批量下载 / **Batch download**: Upload TXT or Excel files for batch processing
+- 📊 **Item Information提取**：自动提取并保存卡片详细信息 / **Item Information extraction**: Automatically extract and save card details
+- 🖼️ **多尺寸选择**：可选择下载原始、大图、中图或小图 / **Size selection**: Choose original, large, medium, or small image sizes
 - ⚡ 实时状态反馈 / Real-time status feedback
 
 ### 命令行使用 / Command Line Usage
@@ -68,6 +74,20 @@ downloader = PSACardImageDownloader()
 downloader.download_images("96098359", save_dir="downloads")
 ```
 
+### 批量下载 / Batch Download
+
+在Web界面中，您可以：
+1. 准备一个TXT或Excel文件，每行一个证书编号
+2. 点击"Batch Download"标签页
+3. 选择图片尺寸（原始/大图/中图/小图）
+4. 上传文件并开始批量下载
+
+**In the Web interface, you can:**
+1. Prepare a TXT or Excel file with one certificate number per line
+2. Click the "Batch Download" tab
+3. Select image size (original/large/medium/small)
+4. Upload the file and start batch downloading
+
 ### 自定义使用
 
 ```python
@@ -79,6 +99,13 @@ image_urls, title = downloader.get_high_res_images("96098359")
 print(f"找到 {len(image_urls)} 张图片")
 for url in image_urls:
     print(url)
+
+# 提取Item Information
+from psa_item_info_extractor import PSAItemInfoExtractor
+extractor = PSAItemInfoExtractor()
+html = downloader._get_page_html("96098359")
+item_info = extractor.extract_item_info(html)
+print(item_info)
 ```
 
 ## 图片保存位置
@@ -88,8 +115,13 @@ for url in image_urls:
 downloads/
 └── PSA_96098359/
     ├── image_1_xxx.jpg  (正面)
-    └── image_2_xxx.jpg  (背面)
+    ├── image_2_xxx.jpg  (背面)
+    └── 96098359_item_info.txt  (Item Information信息)
 ```
+
+**批量下载时**，所有证书的图片会打包在一个ZIP文件中，每个证书的图片保存在独立的文件夹中。
+
+**When batch downloading**, all certificate images are packaged in a single ZIP file, with each certificate's images saved in a separate folder.
 
 ## URL格式支持
 
@@ -117,6 +149,19 @@ downloads/
 - `hd`, `high`, `big`, `max`
 
 同时排除明显不是卡片图片的元素（如logo、图标等）。
+
+### Item Information提取
+
+程序会自动从PSA证书页面提取以下信息：
+- Certificate Number（证书编号）
+- Year（年份）
+- Brand/Title（品牌/标题）
+- Card Number（卡片编号）
+- Subject（主题）
+- Grade（评级）
+- 以及其他可用字段
+
+提取的信息会保存为文本文件，格式为：`{证书编号}_item_info.txt`
 
 ## 注意事项
 
