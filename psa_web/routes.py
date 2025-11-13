@@ -453,8 +453,18 @@ def batch_download_images():
 def download_images():
     try:
         data = request.get_json()
+        if data is None:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid request: JSON data is required'
+            }), 400
+        
         language = data.get('language', 'en')
-        image_size = data.get('image_size', 'original').strip().lower()
+        image_size = data.get('image_size', 'original')
+        if image_size:
+            image_size = str(image_size).strip().lower()
+        else:
+            image_size = 'original'
 
         cert_numbers = data.get('cert_numbers', [])
         cert_number = data.get('cert_number', '').strip()
@@ -811,6 +821,14 @@ def download_images():
         error_msg = str(e)
         error_type = type(e).__name__
         
+        # 检查是否是403错误
+        is_403_error = (
+            '403' in error_msg or 
+            '访问被拒绝' in error_msg or 
+            'Forbidden' in error_msg or
+            '被PSA网站拒绝' in error_msg
+        )
+        
         # 检查是否是连接错误
         is_connection_error = (
             'ConnectionError' in error_type or 
@@ -822,14 +840,18 @@ def download_images():
         )
         
         if language == 'zh':
-            if is_connection_error:
+            if is_403_error:
+                error_msg = '访问被PSA网站拒绝（HTTP 403）。可能的原因：网站检测到自动化访问、IP被限制或请求频率过高。建议稍后重试或使用代理/VPN。'
+            elif is_connection_error:
                 error_msg = '无法连接到PSA网站服务器，请检查网络连接或稍后重试'
             elif '无法访问' in error_msg or 'unable to access' in error_msg.lower():
                 error_msg = '无法访问PSA网站，请检查网络连接'
             elif 'not found' in error_msg.lower() or '未找到' in error_msg:
                 error_msg = '未找到该证书编号的图片'
         else:
-            if is_connection_error:
+            if is_403_error:
+                error_msg = 'Access denied by PSA website (HTTP 403). Possible reasons: automated access detected, IP restricted, or request rate too high. Please try again later or use a proxy/VPN.'
+            elif is_connection_error:
                 error_msg = 'Unable to connect to PSA website server, please check your network connection or try again later'
             elif 'unable to access' in error_msg.lower():
                 error_msg = 'Unable to access PSA website, please check your network connection'

@@ -137,13 +137,49 @@ class PSACardImageDownloader:
                             self._maybe_rotate_identity()
                         # 如果之前代理失败过，这次就不使用代理
                         proxies_to_use = None if tried_without_proxy else self._current_proxies
+                        
+                        # 构建更完整的请求头，模拟真实浏览器
+                        headers = {
+                            "Referer": "https://www.psacard.com/",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+                            "Accept-Encoding": "gzip, deflate, br",
+                            "Connection": "keep-alive",
+                            "Upgrade-Insecure-Requests": "1",
+                            "Sec-Fetch-Dest": "document",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Site": "none",
+                            "Sec-Fetch-User": "?1",
+                            "Cache-Control": "max-age=0"
+                        }
+                        
                         response = self.session.get(
                             url,
                             timeout=(10, 30),  # (连接超时, 读取超时)
                             verify=self.verify_ssl,
                             proxies=proxies_to_use,
-                            headers={"Referer": url}  # 设置Referer为证书页面本身
+                            headers=headers
                         )
+                        
+                        # 检查状态码，如果是403，尝试改进策略
+                        if response.status_code == 403:
+                            if attempt < self.max_retries - 1:
+                                wait_s = (2.0 * (2 ** attempt)) + random.uniform(0.5, 1.5)
+                                print(f"[403] 访问被拒绝，{wait_s:.2f}s 后重试并更换身份...")
+                                time.sleep(wait_s)
+                                self._maybe_rotate_identity(force=True)
+                                # 尝试使用不同的请求头
+                                if attempt == 1:
+                                    # 第二次尝试：使用更简单的请求头
+                                    headers = {
+                                        "User-Agent": self.session.headers.get("User-Agent"),
+                                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                                    }
+                                continue
+                            else:
+                                # 最后一次尝试失败，抛出异常
+                                response.raise_for_status()
+                        
                         response.raise_for_status()
                         print(f"[OK] 成功访问: {url}")
                         # 更新self.base_url为成功访问的URL（去掉/psa后缀）
@@ -280,6 +316,22 @@ class PSACardImageDownloader:
         # 所有URL都失败了
         error_type = type(last_error).__name__ if last_error else "Unknown"
         error_msg = str(last_error) if last_error else "未知错误"
+        
+        # 检查是否是403错误
+        if hasattr(last_error, 'response') and last_error.response is not None:
+            if last_error.response.status_code == 403:
+                friendly_msg = (
+                    f"访问被PSA网站拒绝（HTTP 403）\n"
+                    f"可能的原因：\n"
+                    f"  1. 网站检测到自动化访问并阻止了请求\n"
+                    f"  2. IP地址被临时限制\n"
+                    f"  3. 请求频率过高\n"
+                    f"建议：\n"
+                    f"  - 稍后重试\n"
+                    f"  - 检查网络连接\n"
+                    f"  - 如果问题持续，可能需要使用代理或VPN"
+                )
+                raise requests.RequestException(friendly_msg) from last_error
         
         # 提供更友好的错误消息
         if "10061" in error_msg or "actively refused" in error_msg.lower() or "拒绝" in error_msg:
