@@ -7,6 +7,7 @@ import os
 import time
 import random
 import pandas as pd
+import json
 from werkzeug.utils import secure_filename
 
 from .utils import sanitize_card_name, sanitize_filename, fetch_with_retry, find_certificate_images
@@ -118,27 +119,37 @@ def batch_download_images():
                 continue
             current_app.logger.info(f"[Batch] 证书编号: {cert_num}, 目标尺寸: {image_size}")
             try:
-                # 获取页面HTML以提取Item Information
-                extracted_num = downloader._extract_cert_number(cert_num)
-                html = downloader._get_page_html(extracted_num)
-                item_info = item_info_extractor.extract_item_info(html)
-                brand_title = item_info_extractor.get_brand_title(item_info)
-                
-                # 保存Item Information文件
-                save_path = download_dir / f"PSA_{extracted_num}"
-                save_path.mkdir(parents=True, exist_ok=True)
-                item_info_file = item_info_extractor.save_item_info_text(item_info, save_path, extracted_num)
-                current_app.logger.info(f"[Batch] Item Information已保存: {item_info_file}")
-                
-                # 直接获取目标尺寸的图片列表，避免重复调用
+                # 先使用统一模块查找图片，获取正确的extracted_num
+                # 这样可以确保后续使用的extracted_num与图片数据一致
                 image_list, extracted_num, page_title = find_certificate_images(
                     downloader=downloader,
                     cert_number=cert_num,
                     target_size=image_size,  # 直接使用请求的尺寸
-                    brand_title=brand_title,  # 使用brand title作为文件名
                     logger=current_app.logger,
                     max_images=10  # 下载所有找到的图片
                 )
+                
+                # 使用正确的extracted_num获取页面HTML以提取Item Information
+                try:
+                    html = downloader._get_page_html(extracted_num)
+                    item_info = item_info_extractor.extract_item_info(html)
+                    brand_title = item_info_extractor.get_brand_title(item_info) if item_info else None
+                    
+                    if item_info:
+                        current_app.logger.info(f"[Batch] 证书 {extracted_num} Item Information已提取: {len(item_info)} 个字段")
+                    else:
+                        current_app.logger.warning(f"[Batch] 证书 {extracted_num} 未找到Item Information")
+                except Exception as e:
+                    current_app.logger.warning(f"[Batch] 提取证书 {extracted_num} Item Information时出错: {str(e)}")
+                    item_info = None
+                    brand_title = None
+                
+                # 使用正确的extracted_num保存Item Information文件
+                save_path = download_dir / f"PSA_{extracted_num}"
+                save_path.mkdir(parents=True, exist_ok=True)
+                if item_info:
+                    item_info_file = item_info_extractor.save_item_info_text(item_info, save_path, extracted_num)
+                    current_app.logger.info(f"[Batch] Item Information已保存: {item_info_file}")
                 
                 if not image_list:
                     current_app.logger.warning(f"[Batch] 证书 {extracted_num} 未找到任何图片（尺寸: {image_size}）")
@@ -493,27 +504,37 @@ def download_images():
                 continue
             current_app.logger.info(f"[Download] 证书编号: {cert_num}, 目标尺寸: {image_size}")
             try:
-                # 获取页面HTML以提取Item Information
-                extracted_num = downloader._extract_cert_number(cert_num)
-                html = downloader._get_page_html(extracted_num)
-                item_info = item_info_extractor.extract_item_info(html)
-                brand_title = item_info_extractor.get_brand_title(item_info)
-                
-                # 保存Item Information文件
-                save_path = download_dir / f"PSA_{extracted_num}"
-                save_path.mkdir(parents=True, exist_ok=True)
-                item_info_file = item_info_extractor.save_item_info_text(item_info, save_path, extracted_num)
-                current_app.logger.info(f"[Download] Item Information已保存: {item_info_file}")
-                
-                # 直接获取目标尺寸的图片列表，避免重复调用
+                # 先使用统一模块查找图片，获取正确的extracted_num
+                # 这样可以确保后续使用的extracted_num与图片数据一致
                 image_list, extracted_num, page_title = find_certificate_images(
                     downloader=downloader,
                     cert_number=cert_num,
                     target_size=image_size,  # 直接使用请求的尺寸
-                    brand_title=brand_title,  # 使用brand title作为文件名
                     logger=current_app.logger,
                     max_images=10  # 下载所有找到的图片
                 )
+                
+                # 使用正确的extracted_num获取页面HTML以提取Item Information
+                try:
+                    html = downloader._get_page_html(extracted_num)
+                    item_info = item_info_extractor.extract_item_info(html)
+                    brand_title = item_info_extractor.get_brand_title(item_info) if item_info else None
+                    
+                    if item_info:
+                        current_app.logger.info(f"[Download] 证书 {extracted_num} Item Information已提取: {len(item_info)} 个字段")
+                    else:
+                        current_app.logger.warning(f"[Download] 证书 {extracted_num} 未找到Item Information")
+                except Exception as e:
+                    current_app.logger.warning(f"[Download] 提取证书 {extracted_num} Item Information时出错: {str(e)}")
+                    item_info = None
+                    brand_title = None
+                
+                # 使用正确的extracted_num保存Item Information文件
+                save_path = download_dir / f"PSA_{extracted_num}"
+                save_path.mkdir(parents=True, exist_ok=True)
+                if item_info:
+                    item_info_file = item_info_extractor.save_item_info_text(item_info, save_path, extracted_num)
+                    current_app.logger.info(f"[Download] Item Information已保存: {item_info_file}")
                 
                 if not image_list:
                     current_app.logger.warning(f"[Download] 证书 {extracted_num} 未找到任何图片（尺寸: {image_size}）")
@@ -863,7 +884,7 @@ def preview_images():
             }), 400
 
         language = data.get('language', 'en')
-        image_size = data.get('image_size', 'large')  # 预览默认使用large尺寸
+        image_size = data.get('image_size', 'original')  # 预览默认使用原图尺寸
         cert_numbers = data.get('cert_numbers', [])
         cert_number = data.get('cert_number', '').strip()
         if not cert_numbers and cert_number:
@@ -883,15 +904,18 @@ def preview_images():
             }), 400
 
         downloader = current_app.config['DOWNLOADER']
+        item_info_extractor = PSAItemInfoExtractor()
         all_image_urls = {}
         cert_info = {}
+        all_item_info = {}  # 存储所有证书的Item Information
 
         for cert_num in cert_numbers:
             if not cert_num.strip():
                 continue
             current_app.logger.info(f"[Preview] 开始处理证书: {cert_num}")
             try:
-                # 使用新的统一模块查找图片（预览模式使用指定的尺寸，默认large）
+                # 先使用统一模块查找图片，获取正确的extracted_num
+                # 这样可以确保后续使用的extracted_num与图片数据一致
                 image_list, extracted_num, page_title = find_certificate_images(
                     downloader=downloader,
                     cert_number=cert_num,
@@ -899,6 +923,21 @@ def preview_images():
                     logger=current_app.logger,
                     max_images=10  # 预览可以返回更多图片
                 )
+                
+                # 使用正确的extracted_num获取页面HTML以提取Item Information
+                try:
+                    html = downloader._get_page_html(extracted_num)
+                    item_info = item_info_extractor.extract_item_info(html)
+                    if item_info:
+                        # 直接存储字典对象，Flask的jsonify会自动序列化
+                        all_item_info[extracted_num] = item_info
+                        current_app.logger.info(f"[Preview] 证书 {extracted_num} Item Information已提取: {len(item_info)} 个字段")
+                    else:
+                        all_item_info[extracted_num] = None
+                        current_app.logger.warning(f"[Preview] 证书 {extracted_num} 未找到Item Information")
+                except Exception as e:
+                    current_app.logger.warning(f"[Preview] 提取证书 {extracted_num} Item Information时出错: {str(e)}")
+                    all_item_info[extracted_num] = None
                 
                 # 提取URL列表用于返回
                 urls = [url for url, _, _ in image_list]
@@ -921,9 +960,34 @@ def preview_images():
                     extracted_num = cert_num
                 all_image_urls[extracted_num] = []
                 cert_info[extracted_num] = {'title': f'Error: {str(e)}', 'original': cert_num}
+                all_item_info[extracted_num] = None
 
         total_count = sum(len(urls) for urls in all_image_urls.values())
         current_app.logger.info(f"[Preview] 总计找到 {total_count} 张图片（来自 {len(cert_numbers)} 个证书）")
+        
+        # 输出Item Information的JSON格式到控制台
+        current_app.logger.info(f"[Preview] all_item_info 字典内容: {list(all_item_info.keys())}")
+        current_app.logger.info(f"[Preview] all_item_info 值状态: {[(k, v is not None) for k, v in all_item_info.items()]}")
+        
+        # 检查是否有任何非None的item_info
+        has_item_info = any(v is not None for v in all_item_info.values())
+        current_app.logger.info(f"[Preview] has_item_info = {has_item_info}")
+        
+        if has_item_info:
+            json_output = json.dumps(all_item_info, ensure_ascii=False, indent=2)
+            # 同时使用print和logger确保输出
+            print("\n" + "=" * 80)
+            print("Item Information (JSON格式):")
+            print("=" * 80)
+            print(json_output)
+            print("=" * 80 + "\n")
+            current_app.logger.info("\n" + "=" * 80)
+            current_app.logger.info("Item Information (JSON格式):")
+            current_app.logger.info("=" * 80)
+            current_app.logger.info(json_output)
+            current_app.logger.info("=" * 80 + "\n")
+        else:
+            current_app.logger.warning("[Preview] 所有证书的Item Information均为None，不输出JSON")
         
         # 如果所有证书都没有找到图片，返回错误（但使用200状态码，因为请求已成功处理）
         if total_count == 0:
@@ -937,6 +1001,7 @@ def preview_images():
                 'message': 'No images found for the certificate(s)' if language == 'en' else '未找到该证书编号的图片',
                 'image_urls': all_image_urls,
                 'cert_info': cert_info,
+                'item_info': all_item_info,
                 'count': 0
             }), 200
         
@@ -947,6 +1012,7 @@ def preview_images():
             'success': True,
             'image_urls': all_image_urls,
             'cert_info': cert_info,
+            'item_info': all_item_info,
             'count': total_count
         })
     except ValueError as e:

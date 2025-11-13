@@ -585,8 +585,8 @@
             hidePreview();
 
             try {
-                // 获取图片尺寸，预览默认使用large
-                const imageSize = document.getElementById('imageSize').value || 'large';
+                // 获取图片尺寸，预览默认使用原图
+                const imageSize = document.getElementById('imageSize').value || 'original';
                 
                 const response = await fetch('/api/preview', {
                     method: 'POST',

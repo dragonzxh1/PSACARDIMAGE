@@ -360,6 +360,18 @@ class PSAItemInfoExtractor:
         
         return None
     
+    def format_item_info_json(self, item_info: Dict[str, str]) -> str:
+        """
+        将Item Information字典格式化为JSON字符串
+        
+        Args:
+            item_info: Item Information字典
+            
+        Returns:
+            JSON格式的字符串
+        """
+        return json.dumps(item_info, ensure_ascii=False, indent=2)
+    
     def save_item_info(self, item_info: Dict[str, str], save_path: Path, cert_number: str) -> Path:
         """
         保存Item Information到文件
