@@ -1,6 +1,7 @@
 """
 PSA卡片高清图片下载爬虫
 支持根据PSA证书编号下载对应卡片的高清图片
+支持Cloudflare绕过：优先使用cloudscraper，失败时回退到undetected-chromedriver
 """
 
 import requests
@@ -20,37 +21,148 @@ from psa_item_info_extractor import PSAItemInfoExtractor
 # 禁用SSL警告（因为我们可能禁用SSL验证）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Python 3.13+ SSL 修复：patch SSL 上下文的 verify_mode setter
+# 参考 TOC 实现：先设置 check_hostname = False，再设置 verify_mode = CERT_NONE
+try:
+    import ssl
+    import sys
+    
+    # Python 3.13+ 需要特殊处理
+    if sys.version_info >= (3, 13):
+        # 保存原始的 verify_mode property
+        _original_verify_mode_getter = ssl.SSLContext.verify_mode.__get__
+        _original_verify_mode_setter = ssl.SSLContext.verify_mode.__set__
+        _original_verify_mode_deleter = getattr(ssl.SSLContext.verify_mode, '__delete__', None)
+        
+        def _patched_verify_mode_setter(self, value):
+            """修复的 verify_mode setter，兼容 Python 3.13"""
+            # 如果设置为 CERT_NONE，必须先禁用 check_hostname
+            if value == ssl.CERT_NONE:
+                try:
+                    # 先设置 check_hostname = False（必须在设置 verify_mode 之前）
+                    self.check_hostname = False
+                except Exception:
+                    pass  # 如果设置失败，继续尝试设置 verify_mode
+            # 然后设置 verify_mode
+            try:
+                return _original_verify_mode_setter(self, value)
+            except ValueError as e:
+                # 如果仍然失败，再次尝试设置 check_hostname
+                if "check_hostname" in str(e):
+                    try:
+                        self.check_hostname = False
+                        return _original_verify_mode_setter(self, value)
+                    except:
+                        raise e
+                raise
+        
+        # 创建新的 property 并替换
+        ssl.SSLContext.verify_mode = property(
+            _original_verify_mode_getter,
+            _patched_verify_mode_setter,
+            _original_verify_mode_deleter
+        )
+        
+        # 同时 patch urllib3 的 SSL 上下文创建函数
+        try:
+            from urllib3.util.ssl_ import create_urllib3_context
+            
+            _original_create_urllib3_context = create_urllib3_context
+            
+            def _patched_create_urllib3_context(*args, **kwargs):
+                """修复的 SSL 上下文创建函数，兼容 Python 3.13"""
+                context = _original_create_urllib3_context(*args, **kwargs)
+                # 如果 verify_mode 是 CERT_NONE，确保 check_hostname 也是 False
+                if context.verify_mode == ssl.CERT_NONE:
+                    context.check_hostname = False
+                return context
+            
+            import urllib3.util.ssl_
+            urllib3.util.ssl_.create_urllib3_context = _patched_create_urllib3_context
+        except (ImportError, AttributeError):
+            pass  # urllib3 可能没有这个函数或版本不同
+except Exception as e:
+    # 如果 patch 失败，记录警告但继续
+    import warnings
+    warnings.warn(f"SSL 上下文 patch 失败: {e}，可能无法在 Python 3.13 上禁用 SSL 验证")
+
+# 尝试导入 Cloudflare 绕过工具
+try:
+    import cloudscraper
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    CLOUDSCRAPER_AVAILABLE = False
+
+# 尝试导入 undetected-chromedriver
+try:
+    import undetected_chromedriver as uc
+    UNDETECTED_CHROMEDRIVER_AVAILABLE = True
+except ImportError:
+    UNDETECTED_CHROMEDRIVER_AVAILABLE = False
+
 
 class PSACardImageDownloader:
     """PSA卡片高清图片下载器"""
     
-    def __init__(self, base_url: str = "https://www.psacard.com/cert", verify_ssl: bool = False):
+    def __init__(self, base_url: str = "https://www.psacard.co.jp/cert", verify_ssl: bool = False, 
+                 use_cloudscraper: bool = True, use_selenium_fallback: bool = True, headless: bool = False):
         """
         初始化下载器
         
         Args:
-            base_url: PSA证书验证页面的基础URL（主URL）
+            base_url: PSA证书验证页面的基础URL（主URL，默认日本官网）
             verify_ssl: 是否验证SSL证书（默认False，避免证书验证错误）
+            use_cloudscraper: 是否优先使用cloudscraper绕过Cloudflare（默认True）
+            use_selenium_fallback: 如果cloudscraper失败，是否使用Selenium回退（默认True）
+            headless: 使用Selenium时是否使用无头模式（默认False，显示浏览器窗口）
         """
         self.base_url = base_url.rstrip('/')
         # 备选URL列表（如果主URL失败，会尝试这些）
+        # 搜索顺序：先日本官网，再美国官网
         self.backup_urls = [
-            "https://www.psacard.co.jp/cert",
-            "https://www.psacard.com/cert"
+            "https://www.psacard.com/cert"  # 美国官网作为备选
         ]
         self.verify_ssl = verify_ssl
-        self.session = requests.Session()
-        # 禁用SSL验证（如果verify_ssl为False）
-        self.session.verify = verify_ssl
-        # 设置请求头，模拟浏览器
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        })
+        self.use_cloudscraper = use_cloudscraper and CLOUDSCRAPER_AVAILABLE
+        self.use_selenium_fallback = use_selenium_fallback and UNDETECTED_CHROMEDRIVER_AVAILABLE
+        self.headless = headless
+        self.selenium_driver = None
+        
+        # 初始化会话：优先使用cloudscraper
+        if self.use_cloudscraper:
+            try:
+                # 创建 cloudscraper session
+                self.session = cloudscraper.create_scraper(
+                    browser={
+                        'browser': 'chrome',
+                        'platform': 'windows',
+                        'desktop': True
+                    }
+                )
+                # 设置 SSL 验证（模块级别的 patch 已经处理了 Python 3.13 的问题）
+                self.session.verify = verify_ssl
+                print("[INFO] 使用 cloudscraper 绕过 Cloudflare")
+            except Exception as e:
+                print(f"[WARNING] cloudscraper 初始化失败: {e}，回退到 requests")
+                self.session = requests.Session()
+                self.use_cloudscraper = False
+                # 对于普通 requests，直接设置 verify
+                self.session.verify = verify_ssl
+        else:
+            self.session = requests.Session()
+            # 禁用SSL验证（如果verify_ssl为False）
+            self.session.verify = verify_ssl
+        # 设置请求头，模拟浏览器（如果不是cloudscraper）
+        if not self.use_cloudscraper:
+            self.session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            })
+        
         self.max_retries = 3
         self.retry_delay = 1  # 秒
         # 防封与节流
@@ -65,19 +177,129 @@ class PSACardImageDownloader:
         ]
         self._proxy_pool = [p.strip() for p in os.getenv("PSA_PROXIES", "").split(",") if p.strip()]
         self._current_proxies: Optional[Dict[str, str]] = None
-        # 安装 requests 重试适配器
-        retry_config = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry_config, pool_connections=10, pool_maxsize=20)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        # 随机化首个 UA
-        self.session.headers["User-Agent"] = random.choice(self._user_agents)
+        
+        # 安装 requests 重试适配器（仅对普通 requests session）
+        if not self.use_cloudscraper:
+            retry_config = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "OPTIONS"],
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry_config, pool_connections=10, pool_maxsize=20)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
+            # 随机化首个 UA
+            self.session.headers["User-Agent"] = random.choice(self._user_agents)
+    
+    def _is_cloudflare_challenge(self, html: str, status_code: int) -> bool:
+        """
+        检测响应是否是 Cloudflare 挑战页面
+        
+        Args:
+            html: HTML 内容
+            status_code: HTTP 状态码
+            
+        Returns:
+            是否是 Cloudflare 挑战
+        """
+        if status_code == 403:
+            return True
+        
+        # 检查 Cloudflare 特征
+        cloudflare_indicators = [
+            'cf-browser-verification',
+            'cf-challenge',
+            'challenge-platform',
+            'cf-ray',
+            'checking your browser',
+            'just a moment',
+            'ddos protection by cloudflare',
+            'cloudflare',
+        ]
+        
+        html_lower = html.lower()
+        for indicator in cloudflare_indicators:
+            if indicator in html_lower:
+                return True
+        
+        return False
+    
+    def _get_page_with_selenium(self, url: str, cert_number: str, timeout: int = 30) -> Optional[str]:
+        """
+        使用 undetected-chromedriver 获取页面 HTML（绕过 Cloudflare）
+        
+        Args:
+            url: 要访问的 URL
+            cert_number: 证书编号（用于验证）
+            timeout: 超时时间（秒）
+            
+        Returns:
+            页面 HTML，如果失败返回 None
+        """
+        if not self.use_selenium_fallback:
+            return None
+        
+        try:
+            print(f"[Selenium] 尝试使用 undetected-chromedriver 访问: {url}")
+            
+            # 初始化 undetected-chromedriver（如果还没有）
+            if self.selenium_driver is None:
+                options = uc.ChromeOptions()
+                if self.headless:
+                    options.add_argument('--headless')
+                options.add_argument('--no-sandbox')
+                options.add_argument('--disable-dev-shm-usage')
+                options.add_argument('--disable-blink-features=AutomationControlled')
+                
+                # 设置用户代理
+                user_agent = random.choice(self._user_agents)
+                options.add_argument(f'user-agent={user_agent}')
+                
+                self.selenium_driver = uc.Chrome(options=options, version_main=None)
+                self.selenium_driver.set_page_load_timeout(timeout)
+                print("[Selenium] undetected-chromedriver 已初始化")
+            
+            # 访问页面
+            self.selenium_driver.get(url)
+            
+            # 等待页面加载（检查是否通过 Cloudflare 验证）
+            time.sleep(3)  # 等待 Cloudflare 验证完成
+            
+            # 获取页面 HTML
+            html = self.selenium_driver.page_source
+            
+            # 检查是否成功绕过 Cloudflare
+            if self._is_cloudflare_challenge(html, 200):
+                print("[Selenium] 警告: 仍然检测到 Cloudflare 挑战，等待更长时间...")
+                time.sleep(5)  # 再等待 5 秒
+                html = self.selenium_driver.page_source
+            
+            # 验证 HTML 完整性
+            if self._is_html_complete(html, cert_number, url):
+                print(f"[Selenium] 成功获取页面 (HTML长度: {len(html)} 字符)")
+                return html
+            else:
+                print("[Selenium] 警告: HTML 可能不完整")
+                return html  # 仍然返回，让调用者决定
+            
+        except Exception as e:
+            print(f"[Selenium] 使用 undetected-chromedriver 失败: {e}")
+            return None
+    
+    def _cleanup_selenium(self):
+        """清理 Selenium 资源"""
+        if self.selenium_driver:
+            try:
+                self.selenium_driver.quit()
+            except:
+                pass
+            self.selenium_driver = None
+    
+    def __del__(self):
+        """析构函数：清理资源"""
+        self._cleanup_selenium()
         
     def _extract_cert_number(self, cert_input: str) -> str:
         """
@@ -95,10 +317,83 @@ class PSACardImageDownloader:
             raise ValueError(f"无法从输入 '{cert_input}' 中提取有效的证书编号")
         return cert_number
     
+    def _is_html_complete(self, html: str, cert_number: str, url: str) -> bool:
+        """
+        检查HTML是否完整加载
+        
+        Args:
+            html: HTML内容
+            cert_number: 证书编号
+            url: 访问的URL
+            
+        Returns:
+            bool: HTML是否完整
+        """
+        # 检查1: HTML长度（正常PSA页面应该至少有50000字符）
+        html_len = len(html)
+        if html_len < 50000:
+            # 如果HTML太短，但包含ErrorWagner.png，可能是错误页面或未完全加载
+            if 'ErrorWagner.png' in html and html_len < 70000:
+                print(f"[DEBUG] 检测到可能不完整的页面（ErrorWagner.png），HTML长度: {html_len}")
+                # 检查是否有其他有效内容
+                if 'cloudfront.net' not in html:
+                    return False
+            # 如果HTML太短且不包含关键内容，可能未完全加载
+            if html_len < 30000:
+                print(f"[DEBUG] HTML长度过短: {html_len} 字符")
+                return False
+        
+        # 检查2: 是否包含预期的关键内容
+        # PSA Japan页面应该包含cloudfront.net或证书编号
+        has_cloudfront = 'cloudfront.net' in html
+        has_cert_number = cert_number in html
+        has_psa_content = 'psacard' in html.lower() or '証明番号' in html
+        
+        # 如果HTML长度足够但缺少关键内容，可能是加载不完整
+        if html_len > 50000:
+            # 长HTML应该包含cloudfront或证书编号
+            if not has_cloudfront and not has_cert_number and not has_psa_content:
+                print(f"[DEBUG] HTML长度足够但缺少关键内容（cloudfront: {has_cloudfront}, cert_number: {has_cert_number}, psa_content: {has_psa_content}）")
+                return False
+        
+        # 检查3: 如果包含ErrorWagner.png，检查是否有其他有效图片URL
+        if 'ErrorWagner.png' in html:
+            # 检查是否有其他图片URL（cloudfront或/cert/）
+            has_valid_images = 'cloudfront.net' in html or '/cert/' in html
+            if not has_valid_images:
+                print(f"[DEBUG] 检测到错误页面且无有效图片URL")
+                return False
+            # 如果HTML较短且只有ErrorWagner，可能未完全加载
+            if html_len < 70000 and not has_cloudfront:
+                print(f"[DEBUG] HTML较短且只有ErrorWagner，可能未完全加载")
+                return False
+        
+        # 检查4: 检查img标签数量（正常页面应该有多个img标签）
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            img_tags = soup.find_all('img')
+            img_count = len(img_tags)
+            
+            # 如果只有1-2个img标签且包含ErrorWagner，可能未完全加载
+            if img_count <= 2 and 'ErrorWagner.png' in html:
+                # 检查是否有cloudfront URL（可能在JavaScript中）
+                if 'cloudfront.net' not in html:
+                    print(f"[DEBUG] img标签数量过少: {img_count}，且包含ErrorWagner，且无cloudfront URL")
+                    return False
+                else:
+                    # 有cloudfront URL但img标签少，可能是JavaScript动态加载，需要等待
+                    print(f"[DEBUG] img标签数量少但检测到cloudfront URL，可能需要等待JavaScript加载")
+                    return False
+        except Exception as e:
+            # 如果解析失败，但HTML长度足够，可能是格式问题，继续使用
+            print(f"[DEBUG] HTML解析失败: {e}，但继续使用")
+        
+        return True
+    
     def _get_page_html(self, cert_number: str) -> str:
         """
         获取证书页面的HTML内容
-        如果主URL失败，会自动尝试备选URL（psacard.co.jp等）
+        搜索顺序：先搜索日本官网（psacard.co.jp），如果失败再搜索美国官网（psacard.com）
         
         Args:
             cert_number: PSA证书编号
@@ -110,6 +405,7 @@ class PSACardImageDownloader:
             requests.RequestException: 当所有URL都失败时
         """
         # 构建要尝试的URL列表（优先使用主URL，然后是备选URL）
+        # 确保先尝试日本官网，再尝试美国官网
         urls_to_try = [self.base_url] + [url for url in self.backup_urls if url != self.base_url]
         
         last_error = None
@@ -145,10 +441,40 @@ class PSACardImageDownloader:
                             headers={"Referer": url}  # 设置Referer为证书页面本身
                         )
                         response.raise_for_status()
-                        print(f"[OK] 成功访问: {url}")
+                        html = response.text
+                        
+                        # 检查是否是 Cloudflare 挑战（即使状态码是 200）
+                        if self._is_cloudflare_challenge(html, response.status_code):
+                            print(f"[Cloudflare] 检测到 Cloudflare 挑战页面（HTTP {response.status_code}）")
+                            # 如果 cloudscraper 失败，尝试 Selenium 回退
+                            if self.use_selenium_fallback and attempt == self.max_retries - 1:
+                                print("[Cloudflare] 尝试使用 Selenium/undetected-chromedriver 绕过...")
+                                selenium_html = self._get_page_with_selenium(url, cert_number)
+                                if selenium_html and self._is_html_complete(selenium_html, cert_number, url):
+                                    print(f"[Selenium] 成功绕过 Cloudflare: {url} (HTML长度: {len(selenium_html)} 字符)")
+                                    self.base_url = base_url
+                                    return selenium_html
+                                else:
+                                    print("[Selenium] Selenium 方法也失败，继续尝试其他方法...")
+                            # 如果是最后一次尝试且 Selenium 也失败，继续处理
+                            if attempt < self.max_retries - 1:
+                                print(f"[Cloudflare] 等待后重试...")
+                                time.sleep(2 + random.uniform(0.5, 1.5))
+                                continue
+                        
+                        # 检查HTML完整性
+                        if not self._is_html_complete(html, cert_number, url):
+                            if attempt < self.max_retries - 1:
+                                print(f"[警告] HTML可能不完整（长度: {len(html)} 字符），等待后重试...")
+                                time.sleep(2 + random.uniform(0.5, 1.5))  # 等待2-3.5秒让页面完全加载
+                                continue
+                            else:
+                                print(f"[警告] HTML可能不完整，但已达到最大重试次数，继续使用当前HTML")
+                        
+                        print(f"[OK] 成功访问: {url} (HTML长度: {len(html)} 字符)")
                         # 更新self.base_url为成功访问的URL（去掉/psa后缀）
                         self.base_url = base_url
-                        return response.text
+                        return html
                     except requests.exceptions.ProxyError as e:
                         # 代理错误：尝试不使用代理直接连接
                         if not tried_without_proxy:
@@ -166,9 +492,20 @@ class PSACardImageDownloader:
                                     headers={"Referer": url}
                                 )
                                 response.raise_for_status()
-                                print(f"[OK] 成功访问（不使用代理）: {url}")
+                                html = response.text
+                                
+                                # 检查HTML完整性
+                                if not self._is_html_complete(html, cert_number, url):
+                                    if attempt < self.max_retries - 1:
+                                        print(f"[警告] HTML可能不完整（长度: {len(html)} 字符），等待后重试...")
+                                        time.sleep(2 + random.uniform(0.5, 1.5))
+                                        continue
+                                    else:
+                                        print(f"[警告] HTML可能不完整，但已达到最大重试次数，继续使用当前HTML")
+                                
+                                print(f"[OK] 成功访问（不使用代理）: {url} (HTML长度: {len(html)} 字符)")
                                 self.base_url = base_url
-                                return response.text
+                                return html
                             except Exception as e2:
                                 last_error = e2
                                 if attempt < self.max_retries - 1:
@@ -204,9 +541,20 @@ class PSACardImageDownloader:
                                     headers={"Referer": url}
                                 )
                                 response.raise_for_status()
-                                print(f"[OK] 成功访问（禁用SSL验证）: {url}")
+                                html = response.text
+                                
+                                # 检查HTML完整性
+                                if not self._is_html_complete(html, cert_number, url):
+                                    if attempt < self.max_retries - 1:
+                                        print(f"[警告] HTML可能不完整（长度: {len(html)} 字符），等待后重试...")
+                                        time.sleep(2 + random.uniform(0.5, 1.5))
+                                        continue
+                                    else:
+                                        print(f"[警告] HTML可能不完整，但已达到最大重试次数，继续使用当前HTML")
+                                
+                                print(f"[OK] 成功访问（禁用SSL验证）: {url} (HTML长度: {len(html)} 字符)")
                                 self.base_url = base_url
-                                return response.text
+                                return html
                             except Exception as e2:
                                 last_error = e2
                                 break
@@ -232,9 +580,20 @@ class PSACardImageDownloader:
                                     headers={"Referer": url}
                                 )
                                 response.raise_for_status()
-                                print(f"[OK] 成功访问（不使用代理）: {url}")
+                                html = response.text
+                                
+                                # 检查HTML完整性
+                                if not self._is_html_complete(html, cert_number, url):
+                                    if attempt < self.max_retries - 1:
+                                        print(f"[警告] HTML可能不完整（长度: {len(html)} 字符），等待后重试...")
+                                        time.sleep(2 + random.uniform(0.5, 1.5))
+                                        continue
+                                    else:
+                                        print(f"[警告] HTML可能不完整，但已达到最大重试次数，继续使用当前HTML")
+                                
+                                print(f"[OK] 成功访问（不使用代理）: {url} (HTML长度: {len(html)} 字符)")
                                 self.base_url = base_url
-                                return response.text
+                                return html
                             except Exception as e2:
                                 last_error = e2
                                 if attempt < self.max_retries - 1:
@@ -257,8 +616,31 @@ class PSACardImageDownloader:
                             else:
                                 break
                     except requests.RequestException as e:
-                        # 命中限制时延长退避并轮换身份
+                        # 检查是否是 Cloudflare 挑战
                         status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+                        html_content = ""
+                        if hasattr(e, "response") and e.response is not None:
+                            try:
+                                html_content = e.response.text
+                            except:
+                                pass
+                        
+                        # 如果是 Cloudflare 挑战，尝试使用 Selenium 回退
+                        if status == 403 or (status and self._is_cloudflare_challenge(html_content, status)):
+                            print(f"[Cloudflare] 检测到 Cloudflare 挑战（HTTP {status}）")
+                            
+                            # 如果 cloudscraper 失败，尝试 Selenium 回退
+                            if self.use_selenium_fallback and attempt == self.max_retries - 1:
+                                print("[Cloudflare] 尝试使用 Selenium/undetected-chromedriver 绕过...")
+                                selenium_html = self._get_page_with_selenium(url, cert_number)
+                                if selenium_html and self._is_html_complete(selenium_html, cert_number, url):
+                                    print(f"[Selenium] 成功绕过 Cloudflare: {url} (HTML长度: {len(selenium_html)} 字符)")
+                                    self.base_url = base_url
+                                    return selenium_html
+                                else:
+                                    print("[Selenium] Selenium 方法也失败，继续尝试其他方法...")
+                        
+                        # 命中限制时延长退避并轮换身份
                         if status in (429, 403):
                             wait_s = (1.5 * (2 ** attempt)) + random.uniform(0.3, 0.9)
                             print(f"命中限制（HTTP {status}），{wait_s:.2f}s 后重试并轮换身份...")
@@ -1017,8 +1399,22 @@ class PSACardImageDownloader:
                             final_urls = urls_with_cert[:2]  # 最多保留2个
                             print(f"[INFO] 预览模式：保留了 {len(final_urls)} 个URL（证书编号可能不匹配）")
                     else:
-                        print(f"[WARNING] 严格过滤：不保留证书编号不匹配的图片，返回空列表")
-                        final_urls = []
+                        # 下载模式：如果所有URL都被过滤掉，说明证书编号不匹配
+                        # 但对于PSA Japan等特殊情况，页面中显示的图片证书编号可能与页面URL不一致
+                        # 在这种情况下，应该保留页面中找到的所有图片（即使证书编号不一致）
+                        print(f"[WARNING] 下载模式：所有图片的证书编号都不匹配（期望 {cert_num}）")
+                        print(f"[WARNING] 下载模式：页面中显示的图片证书编号与页面URL不一致")
+                        if found_cert_nums:
+                            print(f"[WARNING] 下载模式：页面中找到的图片证书编号: {', '.join(found_cert_nums)}（期望 {cert_num}）")
+                            print(f"[INFO] 下载模式：这是PSA Japan等特殊情况，保留页面中找到的所有图片")
+                            # 在下载模式下，如果证书编号不匹配，但找到了其他证书编号的图片，
+                            # 说明可能是PSA Japan等特殊情况，应该保留这些图片
+                            final_urls = urls_with_cert[:10]  # 最多保留10个（通常是front和back）
+                            print(f"[INFO] 下载模式：保留了 {len(final_urls)} 个URL（证书编号可能不匹配）")
+                        else:
+                            # 如果没有找到任何包含证书编号的URL，返回空列表
+                            print(f"[WARNING] 严格过滤：不保留证书编号不匹配的图片，返回空列表")
+                            final_urls = []
                 else:
                     # 如果没有找到任何证书编号，在预览模式下尝试保留这些URL
                     if preview_mode:
